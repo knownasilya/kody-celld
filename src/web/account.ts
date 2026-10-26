@@ -1,5 +1,6 @@
 import type { Env } from '../env.ts'
 import { getUserCell } from '../execute/engine.ts'
+import { runJobNow } from '../jobs/dispatcher.ts'
 import { recordAudit } from '../lib/audit.ts'
 import { KodyError } from '../lib/errors.ts'
 import { loadEmailConfig } from '../email/service.ts'
@@ -38,6 +39,8 @@ const flashes: Record<string, PageFlash> = {
 	forked: { kind: 'ok', text: 'Package forked into your catalog.' },
 	published: { kind: 'ok', text: 'Published to the community catalog.' },
 	unpublished: { kind: 'ok', text: 'Removed from the community catalog.' },
+	job_ran: { kind: 'ok', text: 'Job ran. Its result is in the run history.' },
+	job_failed: { kind: 'error', text: 'Job ran and failed. The error is in the run history.' },
 }
 
 function view(
@@ -115,7 +118,7 @@ export function isAccountRoute(pathname: string) {
 	return pathname === '/account' || pathname.startsWith('/account/')
 }
 
-export async function handleAccount(request: Request, env: Env, url: URL): Promise<Response> {
+export async function handleAccount(request: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
 	const alias = request.method === 'GET' ? accountAliasLocation(url) : null
 	if (alias) return redirect(alias)
 	const session = await readWebSession(request, env)
@@ -130,6 +133,12 @@ export async function handleAccount(request: Request, env: Env, url: URL): Promi
 	if (post) assertCsrf(request, env, session, form)
 	const audit = (action: string, target: string | null, details: Record<string, unknown> | null = null) =>
 		recordAudit(env, { actor: `user:${session.user.id}`, action, target, details })
+	// Same path as the jobRunNow capability: trigger "manual", schedule untouched.
+	const runJob = async (job: NonNullable<Awaited<ReturnType<typeof userCell.jobGet>>>) => {
+		const outcome = await runJobNow(env, ctx.exports, session.user, job, 'manual')
+		await audit('job.run', job.id, { ok: outcome.ok, runId: outcome.runId, via: 'web' })
+		return outcome.ok ? 'job_ran' : 'job_failed'
+	}
 
 	const detailPath = matchAccountDetailPath(url)
 	if (detailPath?.kind === 'package') {
@@ -286,6 +295,9 @@ export async function handleAccount(request: Request, env: Env, url: URL): Promi
 				await userCell.jobUpdate({ id: detailPath.jobId, enabled })
 				await audit('job.update', detailPath.jobId, { enabled, via: 'web' })
 				return redirect(hrefWithFlash(detailHref, 'saved'))
+			}
+			if (form.action === 'run' && form.id === detailPath.jobId) {
+				return redirect(hrefWithFlash(detailHref, await runJob(job)))
 			}
 			return redirect(detailHref)
 		}
@@ -599,6 +611,11 @@ export async function handleAccount(request: Request, env: Env, url: URL): Promi
 				if (form.action === 'toggle' && form.id) {
 					await userCell.jobUpdate({ id: form.id, enabled: form.enabled === 'true' })
 					await audit('job.update', form.id, { enabled: form.enabled === 'true', via: 'web' })
+				}
+				if (form.action === 'run' && form.id) {
+					const job = await userCell.jobGet(form.id)
+					if (!job) throw new KodyError('job_not_found', `Job "${form.id}" was not found.`, { status: 404 })
+					return redirect(`/account/jobs?flash=${await runJob(job)}`)
 				}
 				return redirect('/account/jobs?flash=saved')
 			}
